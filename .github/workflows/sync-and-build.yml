@@ -126,7 +126,7 @@ jobs:
           # 官方 TUI 资源收集依赖共享 workspace 包的 dist。
           pnpm build:sea:prepare
           pnpm build:zcode --base-url https://zcode-mirror.invalid/releases/
-          node -e 'const p=require("./dist/zcode/zcode/package.json"); if(p.name!=="zcode-runtime")process.exit(1)'
+          node -e 'const p=require("./package.json"); const f=`./dist/zcode/releases/${p.version}/zcode-${p.version}.tar.gz`; require("fs").accessSync(f); console.log(f)'
 
       - name: Package official distribution for npm and Releases
 
@@ -135,7 +135,8 @@ jobs:
           set -e
           rm -rf stage/zcode
           mkdir -p stage
-          cp -r dist/zcode/zcode stage/zcode
+          UPSTREAM_VERSION=$(node -p 'require("./package.json").version')
+          tar -xzf "dist/zcode/releases/$UPSTREAM_VERSION/zcode-$UPSTREAM_VERSION.tar.gz" -C stage
           STAGE="$PWD/stage/zcode"
           # 不改上游 runner；npm 通过无扩展名入口加载它，并保持真实 Agent argv[1]。
           cat > "$STAGE/bin/zcode" <<'EOF'
