@@ -182,19 +182,11 @@ jobs:
           (cd stage && shasum -a 256 "$TARBALL" > "$TARBALL.sha256")
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
 
-      - name: Smoke test official distribution outside the repository
-
-        env:
-          ZCODE_CREDENTIAL_SECRET_FILE: /tmp/zcode-smoke-credentials/secret
+      - name: Smoke test official CLI distribution outside the repository
 
         run: |
-          # 上游测试包含真实 PTY 的 TUI 初始化渲染和键盘退出，不只测 --version。
-          # Linux CI 没有系统钥匙串；仅为隔离的 Web smoke test 配置临时凭据密钥。
-          mkdir -p /tmp/zcode-smoke-credentials
-          chmod 700 /tmp/zcode-smoke-credentials
-          printf 'zcode-mirror-isolated-smoke-test-only' > "$ZCODE_CREDENTIAL_SECRET_FILE"
-          chmod 600 "$ZCODE_CREDENTIAL_SECRET_FILE"
-          node scripts/zcode-distribution-smoke.mjs "stage/${{ steps.pack.outputs.tarball }}"
+          # 只验证 CLI：真实 PTY 的 TUI 初始化渲染和键盘退出；不启动 Web，不调用模型。
+          node scripts/smoke-cli-distribution.mjs "stage/${{ steps.pack.outputs.tarball }}"
 
       - name: Upload to GitHub Releases
 
