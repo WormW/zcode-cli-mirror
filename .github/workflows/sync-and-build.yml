@@ -1,211 +1,242 @@
 name: Sync upstream and build ZCode CLI
 
-# 定时同步上游 zai-org/ZCode 的 main 分支，构建官方 Agent CLI，
-# 打成 tarball 发到本仓库 Releases，并同步发布到 npm。
-# 上游代码零修改，npm package.json 仅在构建产物中生成。
+# 分别检出镜像配置和上游源码，构建 CLI-only 产物并发布到 Releases/npm。
+# 不修改或推送上游源码，也不向镜像 main 自动合并上游提交。
 
 on:
   schedule:
-    - cron: '0 2 * * *'   # 每天 02:00 UTC = 10:00 北京
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Upstream ref to build (branch / tag / sha). 留空则同步 main。'
+        description: "Upstream ref to build (branch / tag / sha). 留空则构建 main。"
         required: false
-        default: ''
+        default: ""
       skip_npm:
-        description: '仅发布 GitHub Release，不发布 npm'
+        description: "仅发布 GitHub Release，不发布 npm"
         type: boolean
         required: false
         default: false
       verify_npm:
-        description: '只验证已接受的 npm 版本，不构建、不重新 publish（格式 latest 或 0.0.0-nightly...）'
+        description: "只验证已发布 npm 版本或 latest/nightly，不构建、不重新 publish"
         required: false
-        default: ''
+        default: ""
 
-permissions:
-  contents: write
-  id-token: write       # npm provenance / Sigstore
+env:
+  NPM_PACKAGE: "@wormw/zcode-cli"
+  NPM_REGISTRY: "https://registry.npmjs.org"
+  NPM_REGISTRY_HOST: "registry.npmjs.org"
+
+concurrency:
+  group: zcode-cli-release
+  cancel-in-progress: false
 
 jobs:
   sync-and-build:
+    if: ${{ github.event_name == 'schedule' || inputs.verify_npm == '' }}
     runs-on: ubuntu-latest
-    if: inputs.verify_npm == ''
-    env:
-      NPM_PACKAGE: '@wormw/zcode-cli'
-      NPM_REGISTRY: 'https://registry.npmjs.org'
-      NPM_REGISTRY_HOST: 'registry.npmjs.org'
-      ZCODE_DATA_BASE_DIR: '/tmp/zcode-smoke-data'
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
     steps:
-      - name: Checkout fork
+      - name: Checkout mirror release helpers
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Add upstream remote
-        run: |
-          git remote add upstream https://github.com/zai-org/ZCode.git
-          git fetch upstream --tags
+      - name: Checkout exact upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: zai-org/ZCode
+          ref: ${{ inputs.ref }}
+          path: upstream-src
+          fetch-depth: 0
 
-      - name: Resolve target ref
+      - name: Resolve target and allocate an immutable version
         id: target
-        run: |
-          if [ -n "${{ inputs.ref }}" ]; then
-            REF="${{ inputs.ref }}"
-          else
-            REF="upstream/main"
-          fi
-          SHA=$(git rev-parse "$REF")
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          # 如果 sha 恰好是某个 tag，用 tag 名做版本号；否则用短 sha
-          TAG=$(git tag --points-at "$SHA" | grep -E '^v[0-9]' | sort -V | tail -1 || true)
-          if [ -n "$TAG" ]; then
-            # 同一上游代码的打包修复递增镜像修订号，不覆盖不可变 npm 版本。
-            PACKAGE_REVISION=1
-            while gh release view "${TAG}-mirror.${PACKAGE_REVISION}" --repo "${{ github.repository }}" >/dev/null 2>&1; do
-              PACKAGE_REVISION=$((PACKAGE_REVISION + 1))
-            done
-            VERSION="${TAG}-mirror.${PACKAGE_REVISION}"
-            NPM_VERSION="${TAG#v}-mirror.${PACKAGE_REVISION}"
-            NPM_CHANNEL="latest"
-          else
-            VERSION="nightly-$(date -u +%Y%m%d%H%M%S)-${SHA:0:7}"
-            NPM_VERSION="0.0.0-nightly.$(date -u +%Y%m%d%H%M%S).${SHA:0:7}"
-            NPM_CHANNEL="nightly"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "npm_version=$NPM_VERSION" >> "$GITHUB_OUTPUT"
-          echo "npm_channel=$NPM_CHANNEL" >> "$GITHUB_OUTPUT"
-          echo "Building $REF ($SHA) as $VERSION; npm $NPM_PACKAGE@$NPM_VERSION ($NPM_CHANNEL)"
-
-      - name: Skip if release already exists
-        id: skip
-        run: |
-          if gh release view "${{ steps.target.outputs.version }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "Release ${{ steps.target.outputs.version }} was concurrently created; stopping." >&2
-            exit 1
-          fi
+        working-directory: upstream-src
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Fast-forward main to upstream
-        if: inputs.ref == ''
+          MIRROR_REPOSITORY: ${{ github.repository }}
+          REQUESTED_REF: ${{ inputs.ref }}
         run: |
+          set -e
+          SHA=$(git rev-parse HEAD)
+          NODE_VERSION=$(sed -n 's/^node = "\([^"]*\)"/\1/p' mise.toml | head -1)
+          test -n "$NODE_VERSION"
+          TAG=""
+          if [ -n "$REQUESTED_REF" ] && [ "$REQUESTED_REF" != "main" ]; then
+            TAG=$(git tag --points-at "$SHA" | grep -E '^v[0-9]' | sort -V | tail -1 || true)
+          fi
+          if [ -n "$TAG" ]; then
+            PACKAGE_REVISION=1
+            while true; do
+              RELEASE_TAG="${TAG}-mirror.${PACKAGE_REVISION}"
+              NPM_CANDIDATE="${TAG#v}-mirror.${PACKAGE_REVISION}"
+              if ! gh release view "$RELEASE_TAG" --repo "$MIRROR_REPOSITORY" >/dev/null 2>&1 \
+                && ! npm view "$NPM_PACKAGE@$NPM_CANDIDATE" version >/dev/null 2>&1; then
+                break
+              fi
+              PACKAGE_REVISION=$((PACKAGE_REVISION + 1))
+            done
+            VERSION="$RELEASE_TAG"
+            NPM_VERSION="$NPM_CANDIDATE"
+            NPM_CHANNEL="latest"
+          else
+            TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+            VERSION="nightly-${TIMESTAMP}-${SHA:0:7}"
+            NPM_VERSION="0.0.0-nightly.${TIMESTAMP}.${SHA:0:7}"
+            NPM_CHANNEL="nightly"
+          fi
+          {
+            echo "sha=$SHA"
+            echo "version=$VERSION"
+            echo "npm_version=$NPM_VERSION"
+            echo "npm_channel=$NPM_CHANNEL"
+            echo "node_major=${NODE_VERSION%%.*}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $SHA as $VERSION; npm $NPM_PACKAGE@$NPM_VERSION ($NPM_CHANNEL)"
+
+      - name: Merge the exact upstream SHA into mirror main
+        if: ${{ github.event_name == 'schedule' || inputs.ref == '' }}
+        env:
+          TARGET_SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -e
           git config user.name "zcode-mirror-bot"
           git config user.email "bot@users.noreply.github.com"
-          git checkout main
-          git merge --ff-only upstream/main
+          git remote add upstream https://github.com/zai-org/ZCode.git
+          git fetch upstream "$TARGET_SHA"
+          git checkout -B main origin/main
+          git merge --no-ff "$TARGET_SHA" -m "Merge upstream ${TARGET_SHA:0:12}"
           git push origin main
 
-      - name: Checkout exact upstream sha for build
-
-        run: |
-          # 构建开始前保存 fork 的镜像文档；上游 commit 不包含此文件。
-          cp MIRROR.md "$RUNNER_TEMP/zcode-mirror-README.md"
-          git checkout "${{ steps.target.outputs.sha }}"
-
-      - name: Setup mise (locks Node 24.14.0 + pnpm 10.33.2 per upstream mise.toml)
-
+      - name: Setup upstream Node.js and pnpm
         uses: jdx/mise-action@v2
+        with:
+          working_directory: upstream-src
 
-      - name: Install dependencies (frozen lockfile)
+      - name: Test mirror release helpers
+        run: node --test scripts/test/cli-mirror-release.test.mjs
+
+      - name: Check npm credentials and version availability
+        if: '!inputs.skip_npm'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/zcode-npmrc
+          NPM_VERSION: ${{ steps.target.outputs.npm_version }}
+        run: |
+          set -e
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN repository secret is missing or empty." >&2
+            exit 1
+          fi
+          {
+            echo "registry=$NPM_REGISTRY"
+            echo "//$NPM_REGISTRY_HOST/:_authToken=\${NODE_AUTH_TOKEN}"
+          } > "$NPM_CONFIG_USERCONFIG"
+          chmod 600 "$NPM_CONFIG_USERCONFIG"
+          npm whoami
+          if npm view "$NPM_PACKAGE@$NPM_VERSION" version >/dev/null 2>&1; then
+            echo "$NPM_PACKAGE@$NPM_VERSION already exists; refusing to overwrite it." >&2
+            exit 1
+          fi
+
+      - name: Install upstream dependencies
+        working-directory: upstream-src
         run: |
           # pnpm 10.33 + nodeLinker:hoisted 存在并发 rename race；单核安装规避。
           taskset -c 0 pnpm install --frozen-lockfile
 
-      - name: Build Agent CLI and its workspace deps
+      - name: Build Agent CLI and runtime assets without SEA or Web
+        working-directory: upstream-src
+        run: pnpm build:sea:prepare
 
-        run: pnpm --filter @zcode/cli... build
-
-      - name: Assemble official CLI distribution
-
+      - name: Stamp the mirror version in the Agent build
+        working-directory: upstream-src
+        env:
+          NPM_VERSION: ${{ steps.target.outputs.npm_version }}
         run: |
-          # 上游官方组装入口：包含 Agent、TUI 原生库、workers 和运行时依赖。
-          # 本地占位 URL 仅用于生成安装索引，不会用于 npm 或本 Release 安装。
-          # 官方 TUI 资源收集依赖共享 workspace 包的 dist。
-          pnpm build:sea:prepare
-          pnpm build:zcode --base-url https://zcode-mirror.invalid/releases/
-          node -e 'const p=require("./package.json"); const f=`./dist/zcode/releases/${p.version}/zcode-${p.version}.tar.gz`; require("fs").accessSync(f); console.log(f)'
+          node --input-type=module -e 'import { buildCli } from "./apps/zcode-cli/packages/cli/scripts/build.mjs"; await buildCli({ version: process.env.NPM_VERSION, sourcemap: false })'
 
-      - name: Package official distribution for npm and Releases
-
+      - name: Package CLI-only npm and Release artifacts
         id: pack
+        env:
+          NPM_VERSION: ${{ steps.target.outputs.npm_version }}
+          RELEASE_VERSION: ${{ steps.target.outputs.version }}
+          NODE_MAJOR: ${{ steps.target.outputs.node_major }}
+          REPOSITORY_URL: git+https://github.com/${{ github.repository }}.git
         run: |
           set -e
-          rm -rf stage/zcode
+          rm -rf stage
           mkdir -p stage
-          UPSTREAM_VERSION=$(node -p 'require("./package.json").version')
-          tar -xzf "dist/zcode/releases/$UPSTREAM_VERSION/zcode-$UPSTREAM_VERSION.tar.gz" -C stage
-          STAGE="$PWD/stage/zcode"
-          # 不改上游 runner；npm 通过无扩展名入口加载它，并保持真实 Agent argv[1]。
-          cat > "$STAGE/bin/zcode" <<'EOF'
-          #!/usr/bin/env node
-          import './zcode.mjs';
-          EOF
-          chmod +x "$STAGE/bin/zcode"
-          node -e '
-            const fs = require("fs");
-            const file = "stage/zcode/package.json";
-            const p = JSON.parse(fs.readFileSync(file));
-            Object.assign(p, {
-              name: process.env.NPM_PACKAGE,
-              version: "${{ steps.target.outputs.npm_version }}",
-              private: false,
-              description: "Automated, unmodified build of the official ZCode Agent CLI",
-              license: "Apache-2.0",
-              bin: { zcode: "./bin/zcode" },
-              engines: { node: ">=24.14.0" },
-              repository: { type: "git", url: "git+https://github.com/${{ github.repository }}.git" },
-              publishConfig: { access: "public", registry: process.env.NPM_REGISTRY }
-            });
-            fs.writeFileSync(file, JSON.stringify(p, null, 2) + "\n");
-          '
-          mkdir -p "$STAGE/docs"
-          cp -r apps/zcode-cli/docs/usage "$STAGE/docs/"
-          cp "$RUNNER_TEMP/zcode-mirror-README.md" "$STAGE/README.md"
-          if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
-          cat > "$STAGE/install.sh" <<'EOF'
-          #!/usr/bin/env bash
-          set -e
-          PREFIX="${PREFIX:-$HOME/.local}"
-          mkdir -p "$PREFIX/lib" "$PREFIX/bin"
-          rm -rf "$PREFIX/lib/zcode"
-          cp -R . "$PREFIX/lib/zcode"
-          ln -sf ../lib/zcode/bin/zcode "$PREFIX/bin/zcode"
-          echo "Installed to $PREFIX. Ensure $PREFIX/bin is on your PATH."
-          EOF
-          chmod +x "$STAGE/install.sh"
-          (cd "$STAGE" && npm pack --dry-run --json) > npm-pack-dry-run.json
-          TARBALL="zcode-cli-${{ steps.target.outputs.version }}-node24.tar.gz"
-          tar -czf "stage/$TARBALL" -C stage zcode
-          (cd stage && shasum -a 256 "$TARBALL" > "$TARBALL.sha256")
-          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          node scripts/package-cli-release.mjs \
+            --source upstream-src \
+            --output stage/zcode \
+            --name "$NPM_PACKAGE" \
+            --version "$NPM_VERSION" \
+            --readme MIRROR.md \
+            --registry "$NPM_REGISTRY" \
+            --repository "$REPOSITORY_URL"
+          RELEASE_TARBALL="zcode-cli-${RELEASE_VERSION}-node${NODE_MAJOR}.tar.gz"
+          tar -czf "stage/$RELEASE_TARBALL" -C stage zcode
+          (cd stage && shasum -a 256 "$RELEASE_TARBALL" > "$RELEASE_TARBALL.sha256")
+          (cd stage/zcode && npm pack --json --pack-destination ..) > npm-pack.json
+          NPM_TARBALL=$(node -e 'const p=require("./npm-pack.json"); if(p.length!==1) process.exit(1); process.stdout.write(p[0].filename)')
+          test -f "stage/$NPM_TARBALL"
+          {
+            echo "tarball=$RELEASE_TARBALL"
+            echo "npm_tarball=$NPM_TARBALL"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Smoke test official CLI distribution outside the repository
-
+      - name: Install isolated PTY verification dependency
         run: |
-          # 只验证 CLI：真实 PTY 的 TUI 初始化渲染和键盘退出；不启动 Web，不调用模型。
-          node scripts/smoke-cli-distribution.mjs "stage/${{ steps.pack.outputs.tarball }}"
+          set -e
+          VERIFY_ROOT="$RUNNER_TEMP/zcode-cli-verify-deps"
+          mkdir -p "$VERIFY_ROOT"
+          npm install --prefix "$VERIFY_ROOT" --no-save node-pty
+
+      - name: Verify the exact npm tarball before publishing
+        env:
+          NPM_TARBALL: ${{ steps.pack.outputs.npm_tarball }}
+          ZCODE_CLI_EXPECTED_VERSION: ${{ steps.target.outputs.npm_version }}
+          ZCODE_CLI_VERIFY_ROOT: ${{ runner.temp }}/zcode-cli-verify-deps
+          ZCODE_DATA_BASE_DIR: ${{ runner.temp }}/zcode-cli-npm-pack-smoke-data
+        run: |
+          set -e
+          INSTALL_DIR="$RUNNER_TEMP/npm-pack-install-verify"
+          rm -rf "$INSTALL_DIR"
+          npm install --global --prefix "$INSTALL_DIR" --ignore-scripts "$GITHUB_WORKSPACE/stage/$NPM_TARBALL"
+          mkdir -p "$RUNNER_TEMP/zcode-cli-smoke-home"
+          HOME="$RUNNER_TEMP/zcode-cli-smoke-home" node scripts/verify-installed-tui.mjs "$INSTALL_DIR/bin/zcode"
+
+      - name: Verify the Release tarball outside the repository
+        env:
+          ZCODE_CLI_EXPECTED_VERSION: ${{ steps.target.outputs.npm_version }}
+          ZCODE_CLI_VERIFY_ROOT: ${{ runner.temp }}/zcode-cli-verify-deps
+          ZCODE_DATA_BASE_DIR: ${{ runner.temp }}/zcode-cli-release-smoke-data
+        run: |
+          mkdir -p "$RUNNER_TEMP/zcode-cli-smoke-home"
+          HOME="$RUNNER_TEMP/zcode-cli-smoke-home" node scripts/smoke-cli-distribution.mjs "stage/${{ steps.pack.outputs.tarball }}"
 
       - name: Upload to GitHub Releases
-
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.target.outputs.version }}
           name: ZCode CLI ${{ steps.target.outputs.version }}
           body: |
-            自动镜像构建自上游 [zai-org/ZCode@${{ steps.target.outputs.sha }}](https://github.com/zai-org/ZCode/commit/${{ steps.target.outputs.sha }}).
+            CLI-only 自动构建自上游 [zai-org/ZCode@${{ steps.target.outputs.sha }}](https://github.com/zai-org/ZCode/commit/${{ steps.target.outputs.sha }}).
 
-            - 源码零修改，仅 `pnpm install --frozen-lockfile` + `pnpm --filter @zcode/cli... build`
-            - 运行需要 Node.js >= 24.14.0
-            - 包含官方 Agent CLI、TUI 和本地 Web，不含桌面 GUI
+            - 上游源码检出后不做修改
+            - 包含 Agent CLI、TUI 和所需运行时，不包含桌面 GUI、Web/Server 或 `--web` 模式
+            - 运行需要 Node.js，版本要求见 npm 包 `engines.node`
 
             **安装**：
             ```bash
             tar -xzf ${{ steps.pack.outputs.tarball }}
             cd zcode
-            ./install.sh          # 默认装到 ~/.local，PREFIX=/usr/local 可改
+            ./install.sh
             zcode --version
             ```
 
@@ -218,107 +249,97 @@ jobs:
             stage/${{ steps.pack.outputs.tarball }}.sha256
           prerelease: ${{ contains(steps.target.outputs.version, 'nightly') }}
 
-      - name: Check npm credentials and version availability
-        if: '!inputs.skip_npm'
-        id: npm-check
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/zcode-npmrc
-        run: |
-          set -e
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo 'NPM_TOKEN repository secret is missing or empty.' >&2
-            exit 1
-          fi
-          {
-            echo "registry=$NPM_REGISTRY"
-            echo "//$NPM_REGISTRY_HOST/:_authToken=\${NODE_AUTH_TOKEN}"
-          } > "$NPM_CONFIG_USERCONFIG"
-          chmod 600 "$NPM_CONFIG_USERCONFIG"
-          npm whoami
-          PACKAGE_SPEC="$NPM_PACKAGE@${{ steps.target.outputs.npm_version }}"
-          if npm view "$PACKAGE_SPEC" version >/dev/null 2>&1; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "$PACKAGE_SPEC already exists; publish is not idempotent, so this run must stop." >&2
-            exit 1
-          fi
-          echo "available=true" >> "$GITHUB_OUTPUT"
-
-      - name: Publish package to npm with provenance
+      - name: Publish the verified npm tarball with provenance
         if: '!inputs.skip_npm'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/zcode-npmrc
+          NPM_TARBALL: ${{ steps.pack.outputs.npm_tarball }}
           NPM_VERSION: ${{ steps.target.outputs.npm_version }}
           NPM_CHANNEL: ${{ steps.target.outputs.npm_channel }}
           UPSTREAM_SHA: ${{ steps.target.outputs.sha }}
-        working-directory: stage/zcode
         run: |
           set -e
-          npm publish --access public --tag "$NPM_CHANNEL" --provenance
+          npm publish "stage/$NPM_TARBALL" --access public --tag "$NPM_CHANNEL" --provenance
           echo "$NPM_PACKAGE@$NPM_VERSION published with dist-tag $NPM_CHANNEL (upstream $UPSTREAM_SHA)"
 
       - name: Verify fresh installation from npm
         if: '!inputs.skip_npm'
         env:
           NPM_VERSION: ${{ steps.target.outputs.npm_version }}
-          NPM_CHANNEL: ${{ steps.target.outputs.npm_channel }}
+          ZCODE_CLI_EXPECTED_VERSION: ${{ steps.target.outputs.npm_version }}
+          ZCODE_CLI_VERIFY_ROOT: ${{ runner.temp }}/zcode-cli-verify-deps
+          ZCODE_DATA_BASE_DIR: ${{ runner.temp }}/zcode-cli-registry-smoke-data
         run: |
           set -e
-          # npm 现在会异步处理 publish：先等待，避免过早请求产生 CDN 负缓存。
           sleep 120
           for attempt in $(seq 1 26); do
             if npm view "$NPM_PACKAGE@$NPM_VERSION" version >/dev/null 2>&1; then break; fi
-            if [ "$attempt" = 26 ]; then echo 'Published version is not visible after 15 minutes.' >&2; exit 1; fi
+            if [ "$attempt" = 26 ]; then echo "Published version is not visible after 15 minutes." >&2; exit 1; fi
             sleep 30
           done
-          INSTALL_DIR="$RUNNER_TEMP/npm-install-verify"
-          mkdir -p "$INSTALL_DIR"
+          INSTALL_DIR="$RUNNER_TEMP/npm-registry-install-verify"
+          rm -rf "$INSTALL_DIR"
           npm install --global --prefix "$INSTALL_DIR" --ignore-scripts "$NPM_PACKAGE@$NPM_VERSION"
-          "$INSTALL_DIR/bin/zcode" --version
-          node scripts/verify-installed-tui.mjs "$INSTALL_DIR/bin/zcode"
+          mkdir -p "$RUNNER_TEMP/zcode-cli-smoke-home"
+          HOME="$RUNNER_TEMP/zcode-cli-smoke-home" node scripts/verify-installed-tui.mjs "$INSTALL_DIR/bin/zcode"
           npm dist-tag ls "$NPM_PACKAGE"
           npm view "$NPM_PACKAGE@$NPM_VERSION" dist.tarball dist.integrity --json
 
   verify-npm:
-    # 用于 202 Accepted 后的独立可见性检查，绝不重新 publish。
-    if: inputs.verify_npm != ''
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.verify_npm != '' }}
     runs-on: ubuntu-latest
-    env:
-      NPM_PACKAGE: '@wormw/zcode-cli'
-      NPM_REGISTRY: 'https://registry.npmjs.org'
-      ZCODE_DATA_BASE_DIR: '/tmp/zcode-smoke-data'
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - name: Checkout verification script and PTY runtime
+      - name: Checkout verification scripts
         uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 24.14.0
-      - run: npm install --no-save node-pty
-      - name: Resolve requested version
-        id: version
+
+      - name: Install isolated PTY verification dependency
         run: |
-          if [ "${{ inputs.verify_npm }}" = 'latest' ]; then
-            VERSION=$(npm view "$NPM_PACKAGE@latest" version)
+          VERIFY_ROOT="$RUNNER_TEMP/zcode-cli-verify-deps"
+          mkdir -p "$VERIFY_ROOT"
+          npm install --prefix "$VERIFY_ROOT" --no-save node-pty
+
+      - name: Resolve requested version or dist-tag
+        id: version
+        env:
+          REQUESTED: ${{ inputs.verify_npm }}
+        run: |
+          set -e
+          if [ "$REQUESTED" = "latest" ] || [ "$REQUESTED" = "nightly" ]; then
+            VERSION=$(npm view "$NPM_PACKAGE@$REQUESTED" version)
           else
-            VERSION="${{ inputs.verify_npm }}"
+            VERSION="$REQUESTED"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9A-Za-z][0-9A-Za-z.-]*$ ]]; then
+            echo "Invalid npm version: $VERSION" >&2
+            exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Wait for registry and verify fresh installation
         env:
           NPM_VERSION: ${{ steps.version.outputs.version }}
+          ZCODE_CLI_EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+          ZCODE_CLI_VERIFY_ROOT: ${{ runner.temp }}/zcode-cli-verify-deps
+          ZCODE_DATA_BASE_DIR: ${{ runner.temp }}/zcode-cli-recovery-smoke-data
         run: |
           set -e
           sleep 120
           for attempt in $(seq 1 26); do
             if npm view "$NPM_PACKAGE@$NPM_VERSION" version >/dev/null 2>&1; then break; fi
-            if [ "$attempt" = 26 ]; then echo 'Published version is not visible after 15 minutes.' >&2; exit 1; fi
+            if [ "$attempt" = 26 ]; then echo "Published version is not visible after 15 minutes." >&2; exit 1; fi
             sleep 30
           done
           INSTALL_DIR="$RUNNER_TEMP/npm-install-verify"
           npm install --global --prefix "$INSTALL_DIR" --ignore-scripts "$NPM_PACKAGE@$NPM_VERSION"
-          "$INSTALL_DIR/bin/zcode" --version
-          node scripts/verify-installed-tui.mjs "$INSTALL_DIR/bin/zcode"
+          mkdir -p "$RUNNER_TEMP/zcode-cli-smoke-home"
+          HOME="$RUNNER_TEMP/zcode-cli-smoke-home" node scripts/verify-installed-tui.mjs "$INSTALL_DIR/bin/zcode"
           npm dist-tag ls "$NPM_PACKAGE"
           npm view "$NPM_PACKAGE@$NPM_VERSION" dist.tarball dist.integrity --json
