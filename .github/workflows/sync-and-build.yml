@@ -23,6 +23,10 @@ on:
         type: boolean
         required: false
         default: false
+      verify_npm:
+        description: '只验证已接受的 npm 版本，不构建、不重新 publish（格式 latest 或 0.0.0-nightly...）'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -31,6 +35,7 @@ permissions:
 jobs:
   sync-and-build:
     runs-on: ubuntu-latest
+    if: inputs.verify_npm == ''
     env:
       NPM_PACKAGE: '@wormw/zcode-cli'
       NPM_REGISTRY: 'https://registry.npmjs.org'
@@ -309,6 +314,41 @@ jobs:
           done
           INSTALL_DIR="$RUNNER_TEMP/npm-install-verify"
           mkdir -p "$INSTALL_DIR"
+          npm install --global --prefix "$INSTALL_DIR" --ignore-scripts "$NPM_PACKAGE@$NPM_VERSION"
+          "$INSTALL_DIR/bin/zcode" --version
+          npm dist-tag ls "$NPM_PACKAGE"
+          npm view "$NPM_PACKAGE@$NPM_VERSION" dist.tarball dist.integrity --json
+
+  verify-npm:
+    # 用于 202 Accepted 后的独立可见性检查，绝不重新 publish。
+    if: inputs.verify_npm != ''
+    runs-on: ubuntu-latest
+    env:
+      NPM_PACKAGE: '@wormw/zcode-cli'
+      NPM_REGISTRY: 'https://registry.npmjs.org'
+    steps:
+      - name: Resolve requested version
+        id: version
+        run: |
+          if [ "${{ inputs.verify_npm }}" = 'latest' ]; then
+            VERSION=$(npm view "$NPM_PACKAGE@latest" version)
+          else
+            VERSION="${{ inputs.verify_npm }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for registry and verify fresh installation
+        env:
+          NPM_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          sleep 120
+          for attempt in $(seq 1 26); do
+            if npm view "$NPM_PACKAGE@$NPM_VERSION" version >/dev/null 2>&1; then break; fi
+            if [ "$attempt" = 26 ]; then echo 'Published version is not visible after 15 minutes.' >&2; exit 1; fi
+            sleep 30
+          done
+          INSTALL_DIR="$RUNNER_TEMP/npm-install-verify"
           npm install --global --prefix "$INSTALL_DIR" --ignore-scripts "$NPM_PACKAGE@$NPM_VERSION"
           "$INSTALL_DIR/bin/zcode" --version
           npm dist-tag ls "$NPM_PACKAGE"
