@@ -9,7 +9,7 @@
 - 打包阶段会在不修改上游源码的前提下，对 `agent/node_modules/@zcode/tui` 的 `runTui` 入口包一层 **OSC 7501（Program Status Protocol）** 状态上报，使新版 Herdr（`herdr-core` / `herdr-app`）等终端原生感知 `idle`、`working`、`blocked`（`permission` / `question` / `auth`）、`done`、`error` 与退出 `clear`。可通过 `ZCODE_OSC7501=0` 关闭，或通过 `ZCODE_OSC7501_APP` 自定义 `app` 标识（默认 `zcode`）；若未来上游原生实现 OSC 7501，打包器会自动跳过该包装。
 - 镜像打包器复用上游 `stageTuiRuntime`、`collectSeaPlaywrightAssets` 和 `stageCredentialKeyring` 构建接口，收集六个桌面/服务器目标的 TUI、Playwright 与系统钥匙串资源。缺少必需资源时构建失败。
 - CLI 运行时位于 `agent/node_modules`，不设置顶层 `node_modules`，也不依赖 npm 安装脚本。Node.js 版本要求跟随上游 `mise.toml`。
-- `bin/zcode` 保留 CLI 的 TTY、参数和退出码，并将 `process.argv[1]` 指向真实 Agent 入口。构建时通过上游 `buildCli({ version })` 将 Agent 与 launcher 设置为同一镜像包版本；只有单独的 `--version`/`-v` 由 launcher 直接输出，`--web` 与其他参数一样直接交给 Agent CLI，不启动 Web。
+- `bin/zcode` 保留 CLI 的 TTY、参数和退出码，并将 `process.argv[1]` 指向真实 Agent 入口。构建时通过上游 `buildCli({ version })` 将 Agent 与 launcher 设置为同一镜像包版本；只有单独的 `--version`/`-v` 由 launcher 直接输出，`--web` 与其他参数一样直接交给 Agent CLI，不启动 Web。在默认内置实验性 `node:ffi` 的 Node 26+ 环境下，launcher 会自动屏蔽 `node:ffi` 使 OpenTUI 回落到随包携带的 `koffi` 后端（可通过 `ZCODE_ALLOW_NODE_FFI=1` 放开）。
 - `scripts/package-cli-release.mjs` 是唯一产物组装入口；workflow 不调用 `build:zcode`、`build:sea`，也不生成 SEA 单文件。
 
 ## 安装

@@ -16,6 +16,7 @@ const UPSTREAM_OSC7501_PATTERN = /\]7501;|OSC_7501/i;
 
 const cliRunnerSource = `#!/usr/bin/env node
 import { readFile } from "node:fs/promises";
+import Module from "node:module";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -27,6 +28,35 @@ const args = process.argv.slice(2);
 if (args.length === 1 && ["--version", "-v"].includes(args[0])) {
   console.log(version);
 } else {
+  // Node 26 默认内置实验性 node:ffi，但 @mbears/opentui-core 的 node:ffi 后端尚不支持 usize；
+  // 屏蔽 node:ffi 使其自动回落到已打包的 koffi 后端，需要时可用 ZCODE_ALLOW_NODE_FFI=1 放开。
+  if (
+    process.env.ZCODE_ALLOW_NODE_FFI !== "1" &&
+    (Module.builtinModules.includes("node:ffi") || Module.builtinModules.includes("ffi"))
+  ) {
+    if (typeof Module.registerHooks === "function") {
+      Module.registerHooks({
+        resolve(specifier, context, nextResolve) {
+          if (specifier === "node:ffi" || specifier === "ffi") {
+            const err = new Error(\`Disabled experimental \${specifier} for OpenTUI koffi fallback\`);
+            err.code = "ERR_UNKNOWN_BUILTIN_MODULE";
+            throw err;
+          }
+          return nextResolve(specifier, context);
+        },
+      });
+    } else if (typeof Module._load === "function") {
+      const originalLoad = Module._load;
+      Module._load = function (request, parent, isMain) {
+        if (request === "node:ffi" || request === "ffi") {
+          const err = new Error(\`Disabled experimental \${request} for OpenTUI koffi fallback\`);
+          err.code = "ERR_UNKNOWN_BUILTIN_MODULE";
+          throw err;
+        }
+        return originalLoad.call(this, request, parent, isMain);
+      };
+    }
+  }
   // CLI 自启动子进程依赖真实 Agent 路径；其他参数（包括 --web）不由镜像 launcher 解释。
   process.argv[1] = agentEntry;
   await import(pathToFileURL(agentEntry).href);

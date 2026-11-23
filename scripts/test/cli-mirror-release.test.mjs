@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { test } from "node:test";
 import { EventEmitter } from "node:events";
+import Module from "node:module";
 import { formatOsc7501, wrapRunTuiWithOsc7501 } from "../cli-mirror/osc7501-tui-wrapper.mjs";
 import { assembleCliRelease } from "../package-cli-release.mjs";
 import { verifyInstalledTui } from "../verify-installed-tui.mjs";
@@ -391,3 +392,30 @@ test("OSC 7501 wrapper stays silent when non-TTY or disabled via ZCODE_OSC7501=0
   });
   assert.deepEqual(disabledWrites, []);
 });
+
+test(
+  "bin/zcode blocks experimental node:ffi on Node 26+ unless ZCODE_ALLOW_NODE_FFI=1",
+  { skip: !Module.builtinModules.includes("node:ffi") },
+  async (t) => {
+    const { output } = await fixture(t);
+    await writeFile(
+      join(output, "agent/zcode.cjs"),
+      `let status = "loaded";
+try {
+  require("node:ffi");
+} catch (error) {
+  status = error?.code ?? "error";
+}
+process.stdout.write(status);
+`,
+    );
+    const bin = join(output, "bin/zcode");
+    const blocked = await exec(process.execPath, [bin]);
+    assert.equal(blocked.stdout, "ERR_UNKNOWN_BUILTIN_MODULE");
+
+    const allowed = await exec(process.execPath, [bin], {
+      env: { ...process.env, ZCODE_ALLOW_NODE_FFI: "1" },
+    });
+    assert.equal(allowed.stdout, "loaded");
+  },
+);

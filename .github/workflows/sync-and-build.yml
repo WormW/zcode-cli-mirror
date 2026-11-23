@@ -146,8 +146,18 @@ jobs:
       - name: Install upstream dependencies
         working-directory: upstream-src
         run: |
-          # pnpm 10.33 + nodeLinker:hoisted 存在并发 rename race；单核安装规避。
-          taskset -c 0 pnpm install --frozen-lockfile
+          # pnpm 10.33 + nodeLinker:hoisted 存在并发 rename race（ERR_PNPM_ENOENT）；
+          # 单核 + 单子进程安装并最多重试 3 次以规避偶发失败。
+          for attempt in 1 2 3; do
+            if taskset -c 0 pnpm install --frozen-lockfile --child-concurrency=1; then
+              exit 0
+            fi
+            if [ "$attempt" = "3" ]; then
+              exit 1
+            fi
+            echo "pnpm install failed (attempt $attempt); retrying..." >&2
+            sleep 5
+          done
 
       - name: Build Agent CLI and runtime assets without SEA or Web
         working-directory: upstream-src
