@@ -300,11 +300,12 @@ jobs:
           NPM_CHANNEL: ${{ steps.target.outputs.npm_channel }}
         run: |
           set -e
-          # registry 写入可能有短暂延迟，按 npm view 可见性重试。
-          for attempt in 1 2 3 4 5 6; do
+          # npm 现在会异步处理 publish：先等待，避免过早请求产生 CDN 负缓存。
+          sleep 120
+          for attempt in $(seq 1 26); do
             if npm view "$NPM_PACKAGE@$NPM_VERSION" version >/dev/null 2>&1; then break; fi
-            if [ "$attempt" = 6 ]; then echo 'Published version is not visible after retries.' >&2; exit 1; fi
-            sleep 5
+            if [ "$attempt" = 26 ]; then echo 'Published version is not visible after 15 minutes.' >&2; exit 1; fi
+            sleep 30
           done
           INSTALL_DIR="$RUNNER_TEMP/npm-install-verify"
           mkdir -p "$INSTALL_DIR"
