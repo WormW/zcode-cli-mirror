@@ -123,6 +123,8 @@ jobs:
         run: |
           # 上游官方组装入口：包含 Agent、TUI 原生库、workers 和运行时依赖。
           # 本地占位 URL 仅用于生成安装索引，不会用于 npm 或本 Release 安装。
+          # 官方 TUI 资源收集依赖共享 workspace 包的 dist。
+          pnpm build:sea:prepare
           pnpm build:zcode --base-url https://zcode-mirror.invalid/releases/
           node -e 'const p=require("./dist/zcode/zcode/package.json"); if(p.name!=="zcode-runtime")process.exit(1)'
 
