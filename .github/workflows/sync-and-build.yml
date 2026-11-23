@@ -59,6 +59,7 @@ jobs:
           else
             VERSION="nightly-$(date -u +%Y%m%d)-${SHA:0:7}"
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           # npm 使用合法 semver。正式版发 latest，每日 main 构建发 nightly。
           if [ -n "$TAG" ]; then
             NPM_VERSION="${TAG#v}"
@@ -94,7 +95,10 @@ jobs:
 
       - name: Checkout exact upstream sha for build
         if: steps.skip.outputs.exists == 'false'
-        run: git checkout "${{ steps.target.outputs.sha }}"
+        run: |
+          # 构建开始前保存 fork 的镜像文档；上游 commit 不包含此文件。
+          cp MIRROR.md "$RUNNER_TEMP/zcode-mirror-README.md"
+          git checkout "${{ steps.target.outputs.sha }}"
 
       - name: Setup mise (locks Node 24.14.0 + pnpm 10.33.2 per upstream mise.toml)
         if: steps.skip.outputs.exists == 'false'
@@ -160,7 +164,7 @@ jobs:
           chmod +x "$STAGE/install.sh"
 
           # npm 文档只存在于构建产物，不改上游 README。
-          cp MIRROR.md "$STAGE/README.md"
+          cp "$RUNNER_TEMP/zcode-mirror-README.md" "$STAGE/README.md"
           if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
 
           # 在真正 publish 前验证 npm tarball 内容及可执行入口。
