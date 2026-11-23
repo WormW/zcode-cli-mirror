@@ -81,6 +81,11 @@ export async function verifyInstalledTui(
     const visible = stripVTControlCharacters(screen);
     assert.match(visible, /ZCode/);
     assert.match(visible, /(?:登录|\/login|输入提示词|Type a prompt)/i);
+    assert.match(
+      screen,
+      /\x1b\]7501;state=(?:idle|blocked:kind=auth):app=[^\x1b\x07]+(?:\x1b\\|\x07)/,
+      "Installed TUI did not emit initial OSC 7501 status",
+    );
     terminal.write("\u0003");
     await delay(200);
     if (!exited) terminal.write("\u0003");
@@ -91,7 +96,12 @@ export async function verifyInstalledTui(
       }),
     ]);
     assert.equal(result.exitCode, 0, stripVTControlCharacters(screen));
-    console.log("Installed CLI version, real TUI initialization and keyboard exit passed");
+    assert.match(
+      screen,
+      /\x1b\]7501;state=clear(?::[^\x1b\x07]*)?(?:\x1b\\|\x07)/,
+      "Installed TUI did not emit OSC 7501 clear on exit",
+    );
+    console.log("Installed CLI version, real TUI initialization, OSC 7501 status and keyboard exit passed");
   } finally {
     if (!exited) terminal.kill();
   }

@@ -6,6 +6,7 @@
 
 - 发布产物只有 `zcode` 命令所需的 Agent、TUI、provider 配置、workers 和外置运行时；不包含桌面 GUI、Web 前端、HTTP/WebSocket Server 或 `--web` 模式。
 - 上游源码保持检出原样。镜像只维护 `.github/workflows/sync-and-build.yml`、本文件及 `scripts/` 下的镜像打包和验证辅助文件。
+- 打包阶段会在不修改上游源码的前提下，对 `agent/node_modules/@zcode/tui` 的 `runTui` 入口包一层 **OSC 7501（Program Status Protocol）** 状态上报，使新版 Herdr（`herdr-core` / `herdr-app`）等终端原生感知 `idle`、`working`、`blocked`（`permission` / `question` / `auth`）、`done`、`error` 与退出 `clear`。可通过 `ZCODE_OSC7501=0` 关闭，或通过 `ZCODE_OSC7501_APP` 自定义 `app` 标识（默认 `zcode`）；若未来上游原生实现 OSC 7501，打包器会自动跳过该包装。
 - 镜像打包器复用上游 `stageTuiRuntime`、`collectSeaPlaywrightAssets` 和 `stageCredentialKeyring` 构建接口，收集六个桌面/服务器目标的 TUI、Playwright 与系统钥匙串资源。缺少必需资源时构建失败。
 - CLI 运行时位于 `agent/node_modules`，不设置顶层 `node_modules`，也不依赖 npm 安装脚本。Node.js 版本要求跟随上游 `mise.toml`。
 - `bin/zcode` 保留 CLI 的 TTY、参数和退出码，并将 `process.argv[1]` 指向真实 Agent 入口。构建时通过上游 `buildCli({ version })` 将 Agent 与 launcher 设置为同一镜像包版本；只有单独的 `--version`/`-v` 由 launcher 直接输出，`--web` 与其他参数一样直接交给 Agent CLI，不启动 Web。
@@ -36,6 +37,26 @@ zcode --version
 
 ```bash
 shasum -a 256 -c zcode-cli-*.sha256
+```
+
+### Herdr（新版 `herdr-app` + `herdr-core`）配合配置
+
+镜像产物默认在交互式 TTY 中发射 OSC 7501 状态序列（`app=zcode`）。在 `~/.config/herdr-app/programs.json` 中加入以下条目即可在 `+` 菜单和侧边栏中识别 `zcode`：
+
+```json
+{
+  "programs": {
+    "zcode": {
+      "name": "ZCode",
+      "icon": "my-icons/zcode.svg",
+      "tint": true,
+      "tile": "#334155",
+      "color": "#ffffff",
+      "match": ["zcode", "zcode-cli"],
+      "run": ["zcode"]
+    }
+  }
+}
 ```
 
 ## 同步与发布所有权
