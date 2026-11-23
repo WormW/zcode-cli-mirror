@@ -130,8 +130,8 @@ jobs:
             "license": "Apache-2.0",
             "type": "module",
             "main": "./dist/zcode.cjs",
-            "bin": { "zcode": "./dist/zcode.cjs" },
-            "files": ["dist", "docs", "install.sh"],
+            "bin": { "zcode": "./bin/zcode" },
+            "files": ["bin", "dist", "docs", "install.sh"],
             "engines": { "node": ">=24.14.0" },
             "repository": {
               "type": "git",
@@ -144,6 +144,13 @@ jobs:
             }
           }
           EOF
+          # 使用无扩展名的 Node 转发入口，兼容 npm 11 的 bin 校验。
+          mkdir -p "$STAGE/bin"
+          cat > "$STAGE/bin/zcode" <<'EOF'
+          #!/usr/bin/env node
+          import '../dist/zcode.cjs';
+          EOF
+          chmod +x "$STAGE/bin/zcode"
           # 附带 CLI 文档
           mkdir -p "$STAGE/docs"
           cp -r apps/zcode-cli/docs/usage "$STAGE/docs/" || true
@@ -153,7 +160,7 @@ jobs:
           set -e
           PREFIX="${PREFIX:-$HOME/.local}"
           mkdir -p "$PREFIX/lib/zcode" "$PREFIX/bin"
-          cp -r dist package.json docs "$PREFIX/lib/zcode/"
+          cp -r dist bin package.json docs "$PREFIX/lib/zcode/"
           cat > "$PREFIX/bin/zcode" <<LAUNCH
           #!/usr/bin/env bash
           exec node "$PREFIX/lib/zcode/dist/zcode.cjs" "\$@"
@@ -219,14 +226,18 @@ jobs:
         id: npm-check
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/zcode-npmrc
         run: |
           set -e
           if [ -z "$NODE_AUTH_TOKEN" ]; then
             echo 'NPM_TOKEN repository secret is missing or empty.' >&2
             exit 1
           fi
-          npm config set "//$NPM_REGISTRY_HOST/:_authToken" "$NODE_AUTH_TOKEN" --location=project
-          npm config set registry "$NPM_REGISTRY" --location=project
+          {
+            echo "registry=$NPM_REGISTRY"
+            echo "//$NPM_REGISTRY_HOST/:_authToken=\${NODE_AUTH_TOKEN}"
+          } > "$NPM_CONFIG_USERCONFIG"
+          chmod 600 "$NPM_CONFIG_USERCONFIG"
           npm whoami
           PACKAGE_SPEC="$NPM_PACKAGE@${{ steps.target.outputs.npm_version }}"
           if npm view "$PACKAGE_SPEC" version >/dev/null 2>&1; then
@@ -240,6 +251,7 @@ jobs:
         if: steps.skip.outputs.exists == 'false' && !inputs.skip_npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/zcode-npmrc
           NPM_VERSION: ${{ steps.target.outputs.npm_version }}
           NPM_CHANNEL: ${{ steps.target.outputs.npm_channel }}
           UPSTREAM_SHA: ${{ steps.target.outputs.sha }}
