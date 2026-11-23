@@ -1,0 +1,162 @@
+name: Sync upstream and build ZCode CLI
+
+# 定时同步上游 zai-org/ZCode 的 main 分支，构建官方 Agent CLI，
+# 打成 tarball 发到本仓库 Releases。代码零修改，只做构建和搬运。
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # 每天 02:00 UTC = 10:00 北京
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Upstream ref to build (branch / tag / sha). 留空则同步 main。'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/zai-org/ZCode.git
+          git fetch upstream --tags
+
+      - name: Resolve target ref
+        id: target
+        run: |
+          if [ -n "${{ inputs.ref }}" ]; then
+            REF="${{ inputs.ref }}"
+          else
+            REF="upstream/main"
+          fi
+          SHA=$(git rev-parse "$REF")
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          # 如果 sha 恰好是某个 tag，用 tag 名做版本号；否则用短 sha
+          TAG=$(git tag --points-at "$SHA" | grep -E '^v[0-9]' | head -1 || true)
+          if [ -n "$TAG" ]; then
+            VERSION="$TAG"
+          else
+            VERSION="nightly-$(date -u +%Y%m%d)-${SHA:0:7}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building $REF ($SHA) as $VERSION"
+
+      - name: Skip if release already exists
+        id: skip
+        run: |
+          if gh release view "${{ steps.target.outputs.version }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.target.outputs.version }} already exists, skipping build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fast-forward main to upstream
+        if: steps.skip.outputs.exists == 'false' && inputs.ref == ''
+        run: |
+          git config user.name "zcode-mirror-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git checkout main
+          git merge --ff-only upstream/main
+          git push origin main
+
+      - name: Checkout exact upstream sha for build
+        if: steps.skip.outputs.exists == 'false'
+        run: git checkout "${{ steps.target.outputs.sha }}"
+
+      - name: Setup mise (locks Node 24.14.0 + pnpm 10.33.2 per upstream mise.toml)
+        if: steps.skip.outputs.exists == 'false'
+        uses: jdx/mise-action@v2
+
+      - name: Install dependencies (frozen lockfile)
+        if: steps.skip.outputs.exists == 'false'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Agent CLI and its workspace deps
+        if: steps.skip.outputs.exists == 'false'
+        run: pnpm --filter @zcode/cli... build
+
+      - name: Package CLI artifact
+        if: steps.skip.outputs.exists == 'false'
+        id: pack
+        run: |
+          set -e
+          STAGE="stage/zcode"
+          mkdir -p "$STAGE"
+          # 整个 dist/ 打包（zcode.cjs 入口 + 相邻 runtime 资源）
+          cp -r apps/zcode-cli/packages/cli/dist "$STAGE/dist"
+          # 附带 package.json，让 npm link / 直接 node 都能用
+          cp apps/zcode-cli/packages/cli/package.json "$STAGE/"
+          # 附带 CLI 文档
+          mkdir -p "$STAGE/docs"
+          cp -r apps/zcode-cli/docs/usage "$STAGE/docs/" || true
+          # 安装脚本：把 dist 放到 lib，bin/zcode 转发
+          cat > "$STAGE/install.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          PREFIX="${PREFIX:-$HOME/.local}"
+          mkdir -p "$PREFIX/lib/zcode" "$PREFIX/bin"
+          cp -r dist package.json docs "$PREFIX/lib/zcode/"
+          cat > "$PREFIX/bin/zcode" <<LAUNCH
+          #!/usr/bin/env bash
+          exec node "$PREFIX/lib/zcode/dist/zcode.cjs" "\$@"
+          LAUNCH
+          chmod +x "$PREFIX/bin/zcode"
+          echo "Installed to $PREFIX. Ensure $PREFIX/bin is on your PATH."
+          EOF
+          chmod +x "$STAGE/install.sh"
+
+          cd stage
+          TARBALL="zcode-cli-${{ steps.target.outputs.version }}-node24.tar.gz"
+          tar -czf "$TARBALL" zcode
+          shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          ls -la
+
+      - name: Smoke test the artifact
+        if: steps.skip.outputs.exists == 'false'
+        run: |
+          node stage/zcode/dist/zcode.cjs --version
+          node stage/zcode/dist/zcode.cjs --help | head -30
+
+      - name: Upload to GitHub Releases
+        if: steps.skip.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.target.outputs.version }}
+          name: ZCode CLI ${{ steps.target.outputs.version }}
+          body: |
+            自动镜像构建自上游 [zai-org/ZCode@${{ steps.target.outputs.sha }}](https://github.com/zai-org/ZCode/commit/${{ steps.target.outputs.sha }}).
+
+            - 源码零修改，仅 `pnpm install --frozen-lockfile` + `pnpm --filter @zcode/cli... build`
+            - 运行需要 Node.js >= 24.14.0
+            - 仅包含 Agent CLI（`zcode` 命令），不含桌面 GUI、不含 `--web` 模式
+
+            **安装**：
+            ```bash
+            tar -xzf ${{ steps.pack.outputs.tarball }}
+            cd zcode
+            ./install.sh          # 默认装到 ~/.local，PREFIX=/usr/local 可改
+            zcode --version
+            ```
+
+            **校验**：
+            ```bash
+            shasum -a 256 -c ${{ steps.pack.outputs.tarball }}.sha256
+            ```
+          files: |
+            stage/${{ steps.pack.outputs.tarball }}
+            stage/${{ steps.pack.outputs.tarball }}.sha256
+          prerelease: ${{ contains(steps.target.outputs.version, 'nightly') }}
