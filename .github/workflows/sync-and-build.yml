@@ -260,7 +260,8 @@ jobs:
           UPSTREAM_SHA: ${{ steps.target.outputs.sha }}
         run: |
           set -e
-          npm publish "stage/$NPM_TARBALL" --access public --tag "$NPM_CHANNEL" --provenance
+          # Bug 原因：不带 ./ 的 stage/name 会被 npm 当成 GitHub 仓库简写，而不是本地 tarball。
+          npm publish "./stage/$NPM_TARBALL" --access public --tag "$NPM_CHANNEL" --provenance
           echo "$NPM_PACKAGE@$NPM_VERSION published with dist-tag $NPM_CHANNEL (upstream $UPSTREAM_SHA)"
 
       - name: Verify fresh installation from npm

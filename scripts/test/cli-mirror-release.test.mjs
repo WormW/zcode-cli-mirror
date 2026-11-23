@@ -161,3 +161,11 @@ test(
     assert.deepEqual(JSON.parse(result.stdout).argv, ["tui", "example"]);
   },
 );
+
+test("workflow publishes the npm tarball through an explicit local path", async () => {
+  const workflow = await readFile(
+    new URL("../../.github/workflows/sync-and-build.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(workflow, /npm publish "\.\/stage\/\$NPM_TARBALL"/);
+});
