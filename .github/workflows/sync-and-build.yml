@@ -110,8 +110,9 @@ jobs:
         uses: jdx/mise-action@v2
 
       - name: Install dependencies (frozen lockfile)
-
-        run: pnpm install --frozen-lockfile
+        run: |
+          # pnpm 10.33 + nodeLinker:hoisted 存在并发 rename race；单核安装规避。
+          taskset -c 0 pnpm install --frozen-lockfile
 
       - name: Build Agent CLI and its workspace deps
 
