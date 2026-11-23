@@ -18,6 +18,11 @@ on:
         type: boolean
         required: false
         default: false
+      repair_npm:
+        description: '已有 GitHub Release 时，从该 Release 下载构建产物补发 npm'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
@@ -76,8 +81,14 @@ jobs:
         id: skip
         run: |
           if gh release view "${{ steps.target.outputs.version }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Release ${{ steps.target.outputs.version }} already exists, skipping build."
+            if [ "${{ inputs.repair_npm }}" = 'true' ]; then
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              echo "repair=true" >> "$GITHUB_OUTPUT"
+              echo "Existing release: recovering its artifact for npm publishing."
+            else
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "Release ${{ steps.target.outputs.version }} already exists, skipping build."
+            fi
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
@@ -191,8 +202,29 @@ jobs:
           node stage/zcode/dist/zcode.cjs --version
           node stage/zcode/dist/zcode.cjs --help | head -30
 
+      - name: Recover verified Release artifact for npm repair
+        if: steps.skip.outputs.repair == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p release-artifact
+          gh release download "${{ steps.target.outputs.version }}" --repo "${{ github.repository }}" --dir release-artifact
+          (cd release-artifact && shasum -a 256 -c *.sha256)
+          tar -xzf release-artifact/zcode-cli-*-node24.tar.gz -C release-artifact
+          mkdir -p stage
+          mv release-artifact/zcode stage/zcode
+          # 兼容在 bin 转发入口修复前创建的 Release 产物。
+          if [ ! -f stage/zcode/bin/zcode ]; then
+            mkdir -p stage/zcode/bin
+            printf "#!/usr/bin/env node\nimport '../dist/zcode.cjs';\n" > stage/zcode/bin/zcode
+            chmod +x stage/zcode/bin/zcode
+            node -e 'const fs=require("fs"); const p="stage/zcode/package.json"; const j=JSON.parse(fs.readFileSync(p)); j.bin={zcode:"./bin/zcode"}; j.files=["bin",...j.files.filter(f=>f!=="bin")]; fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n")'
+          fi
+          stage/zcode/bin/zcode --version
+
       - name: Upload to GitHub Releases
-        if: steps.skip.outputs.exists == 'false'
+        if: steps.skip.outputs.exists == 'false' && steps.skip.outputs.repair != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.target.outputs.version }}
