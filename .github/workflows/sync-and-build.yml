@@ -35,7 +35,7 @@ jobs:
       NPM_PACKAGE: '@wormw/zcode-cli'
       NPM_REGISTRY: 'https://registry.npmjs.org'
       NPM_REGISTRY_HOST: 'registry.npmjs.org'
-      ZCODE_DATA_BASE_DIR: ${{ runner.temp }}/zcode-smoke-data
+      ZCODE_DATA_BASE_DIR: '/tmp/zcode-smoke-data'
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -283,7 +283,7 @@ jobs:
     env:
       NPM_PACKAGE: '@wormw/zcode-cli'
       NPM_REGISTRY: 'https://registry.npmjs.org'
-      ZCODE_DATA_BASE_DIR: ${{ runner.temp }}/zcode-smoke-data
+      ZCODE_DATA_BASE_DIR: '/tmp/zcode-smoke-data'
     steps:
       - name: Checkout verification script and PTY runtime
         uses: actions/checkout@v4
