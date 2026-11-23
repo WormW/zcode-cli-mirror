@@ -96,7 +96,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Fast-forward main to upstream
-        if: steps.skip.outputs.exists == 'false' && inputs.ref == ''
+        if: steps.skip.outputs.exists == 'false' && steps.skip.outputs.repair != 'true' && inputs.ref == ''
         run: |
           git config user.name "zcode-mirror-bot"
           git config user.email "bot@users.noreply.github.com"
@@ -105,26 +105,26 @@ jobs:
           git push origin main
 
       - name: Checkout exact upstream sha for build
-        if: steps.skip.outputs.exists == 'false'
+        if: steps.skip.outputs.exists == 'false' && steps.skip.outputs.repair != 'true'
         run: |
           # 构建开始前保存 fork 的镜像文档；上游 commit 不包含此文件。
           cp MIRROR.md "$RUNNER_TEMP/zcode-mirror-README.md"
           git checkout "${{ steps.target.outputs.sha }}"
 
       - name: Setup mise (locks Node 24.14.0 + pnpm 10.33.2 per upstream mise.toml)
-        if: steps.skip.outputs.exists == 'false'
+        if: steps.skip.outputs.exists == 'false' && steps.skip.outputs.repair != 'true'
         uses: jdx/mise-action@v2
 
       - name: Install dependencies (frozen lockfile)
-        if: steps.skip.outputs.exists == 'false'
+        if: steps.skip.outputs.exists == 'false' && steps.skip.outputs.repair != 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Build Agent CLI and its workspace deps
-        if: steps.skip.outputs.exists == 'false'
+        if: steps.skip.outputs.exists == 'false' && steps.skip.outputs.repair != 'true'
         run: pnpm --filter @zcode/cli... build
 
       - name: Package CLI artifact
-        if: steps.skip.outputs.exists == 'false'
+        if: steps.skip.outputs.exists == 'false' && steps.skip.outputs.repair != 'true'
         id: pack
         run: |
           set -e
@@ -197,7 +197,7 @@ jobs:
           ls -la
 
       - name: Smoke test the artifact
-        if: steps.skip.outputs.exists == 'false'
+        if: steps.skip.outputs.exists == 'false' && steps.skip.outputs.repair != 'true'
         run: |
           node stage/zcode/dist/zcode.cjs --version
           node stage/zcode/dist/zcode.cjs --help | head -30
