@@ -1,7 +1,8 @@
 name: Sync upstream and build ZCode CLI
 
 # 定时同步上游 zai-org/ZCode 的 main 分支，构建官方 Agent CLI，
-# 打成 tarball 发到本仓库 Releases。代码零修改，只做构建和搬运。
+# 打成 tarball 发到本仓库 Releases，并同步发布到 npm。
+# 上游代码零修改，npm package.json 仅在构建产物中生成。
 
 on:
   schedule:
@@ -12,13 +13,23 @@ on:
         description: 'Upstream ref to build (branch / tag / sha). 留空则同步 main。'
         required: false
         default: ''
+      skip_npm:
+        description: '仅发布 GitHub Release，不发布 npm'
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write
+  id-token: write       # npm provenance / Sigstore
 
 jobs:
   sync-and-build:
     runs-on: ubuntu-latest
+    env:
+      NPM_PACKAGE: '@wormw/zcode-cli'
+      NPM_REGISTRY: 'https://registry.npmjs.org'
+      NPM_REGISTRY_HOST: 'registry.npmjs.org'
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -48,8 +59,17 @@ jobs:
           else
             VERSION="nightly-$(date -u +%Y%m%d)-${SHA:0:7}"
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Building $REF ($SHA) as $VERSION"
+          # npm 使用合法 semver。正式版发 latest，每日 main 构建发 nightly。
+          if [ -n "$TAG" ]; then
+            NPM_VERSION="${TAG#v}"
+            NPM_CHANNEL="latest"
+          else
+            NPM_VERSION="0.0.0-nightly.$(date -u +%Y%m%d%H%M%S).${SHA:0:7}"
+            NPM_CHANNEL="nightly"
+          fi
+          echo "npm_version=$NPM_VERSION" >> "$GITHUB_OUTPUT"
+          echo "npm_channel=$NPM_CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "Building $REF ($SHA) as $VERSION; npm $NPM_PACKAGE@$NPM_VERSION ($NPM_CHANNEL)"
 
       - name: Skip if release already exists
         id: skip
@@ -97,8 +117,29 @@ jobs:
           mkdir -p "$STAGE"
           # 整个 dist/ 打包（zcode.cjs 入口 + 相邻 runtime 资源）
           cp -r apps/zcode-cli/packages/cli/dist "$STAGE/dist"
-          # 附带 package.json，让 npm link / 直接 node 都能用
-          cp apps/zcode-cli/packages/cli/package.json "$STAGE/"
+          # 附带 npm 发布用 package.json。上游源码保持 private:true，不修改。
+          cat > "$STAGE/package.json" <<EOF
+          {
+            "name": "$NPM_PACKAGE",
+            "version": "${{ steps.target.outputs.npm_version }}",
+            "description": "Automated, unmodified build of the official ZCode Agent CLI",
+            "license": "Apache-2.0",
+            "type": "module",
+            "main": "./dist/zcode.cjs",
+            "bin": { "zcode": "./dist/zcode.cjs" },
+            "files": ["dist", "docs", "install.sh"],
+            "engines": { "node": ">=24.14.0" },
+            "repository": {
+              "type": "git",
+              "url": "git+https://github.com/${{ github.repository }}.git"
+            },
+            "homepage": "https://github.com/${{ github.repository }}#readme",
+            "publishConfig": {
+              "access": "public",
+              "registry": "$NPM_REGISTRY"
+            }
+          }
+          EOF
           # 附带 CLI 文档
           mkdir -p "$STAGE/docs"
           cp -r apps/zcode-cli/docs/usage "$STAGE/docs/" || true
@@ -117,6 +158,14 @@ jobs:
           echo "Installed to $PREFIX. Ensure $PREFIX/bin is on your PATH."
           EOF
           chmod +x "$STAGE/install.sh"
+
+          # npm 文档只存在于构建产物，不改上游 README。
+          cp MIRROR.md "$STAGE/README.md"
+          if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
+
+          # 在真正 publish 前验证 npm tarball 内容及可执行入口。
+          node -e 'const p=require("./stage/zcode/package.json"); if(p.private || !p.bin?.zcode) process.exit(1)'
+          (cd "$STAGE" && npm pack --dry-run --json) > npm-pack-dry-run.json
 
           cd stage
           TARBALL="zcode-cli-${{ steps.target.outputs.version }}-node24.tar.gz"
@@ -160,3 +209,58 @@ jobs:
             stage/${{ steps.pack.outputs.tarball }}
             stage/${{ steps.pack.outputs.tarball }}.sha256
           prerelease: ${{ contains(steps.target.outputs.version, 'nightly') }}
+
+      - name: Check npm credentials and version availability
+        if: steps.skip.outputs.exists == 'false' && !inputs.skip_npm
+        id: npm-check
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -e
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo 'NPM_TOKEN repository secret is missing or empty.' >&2
+            exit 1
+          fi
+          npm config set "//$NPM_REGISTRY_HOST/:_authToken" "$NODE_AUTH_TOKEN" --location=project
+          npm config set registry "$NPM_REGISTRY" --location=project
+          npm whoami
+          PACKAGE_SPEC="$NPM_PACKAGE@${{ steps.target.outputs.npm_version }}"
+          if npm view "$PACKAGE_SPEC" version >/dev/null 2>&1; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "$PACKAGE_SPEC already exists; publish is not idempotent, so this run must stop." >&2
+            exit 1
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish package to npm with provenance
+        if: steps.skip.outputs.exists == 'false' && !inputs.skip_npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_VERSION: ${{ steps.target.outputs.npm_version }}
+          NPM_CHANNEL: ${{ steps.target.outputs.npm_channel }}
+          UPSTREAM_SHA: ${{ steps.target.outputs.sha }}
+        working-directory: stage/zcode
+        run: |
+          set -e
+          npm publish --access public --tag "$NPM_CHANNEL" --provenance
+          echo "$NPM_PACKAGE@$NPM_VERSION published with dist-tag $NPM_CHANNEL (upstream $UPSTREAM_SHA)"
+
+      - name: Verify fresh installation from npm
+        if: steps.skip.outputs.exists == 'false' && !inputs.skip_npm
+        env:
+          NPM_VERSION: ${{ steps.target.outputs.npm_version }}
+          NPM_CHANNEL: ${{ steps.target.outputs.npm_channel }}
+        run: |
+          set -e
+          # registry 写入可能有短暂延迟，按 npm view 可见性重试。
+          for attempt in 1 2 3 4 5 6; do
+            if npm view "$NPM_PACKAGE@$NPM_VERSION" version >/dev/null 2>&1; then break; fi
+            if [ "$attempt" = 6 ]; then echo 'Published version is not visible after retries.' >&2; exit 1; fi
+            sleep 5
+          done
+          INSTALL_DIR="$RUNNER_TEMP/npm-install-verify"
+          mkdir -p "$INSTALL_DIR"
+          npm install --global --prefix "$INSTALL_DIR" --ignore-scripts "$NPM_PACKAGE@$NPM_VERSION"
+          "$INSTALL_DIR/bin/zcode" --version
+          npm dist-tag ls "$NPM_PACKAGE"
+          npm view "$NPM_PACKAGE@$NPM_VERSION" dist.tarball dist.integrity --json
